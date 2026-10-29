@@ -1,0 +1,207 @@
+#!/bin/bash
+# archinst - TUI installer for Arch Linux (UEFI, GRUB, NetworkManager)
+# Run from the live ISO:  archinst
+
+set -euo pipefail
+
+R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'
+C=$'\033[36m'; W=$'\033[1m'; N=$'\033[0m'
+BT="archinst - Arch Linux installer"
+
+setfont cyr-sun16 2>/dev/null || true
+
+ok()   { echo -e "${G}[ OK ]${N} $*"; }
+info() { echo -e "${C}[ .. ]${N} $*"; }
+die()  { clear; echo -e "${R}[FAIL]${N} $*" >&2; exit 1; }
+
+# dialog wrapper: result on stdout, Cancel/Esc aborts the installer
+d() { dialog --stdout --backtitle "$BT" "$@" || { clear; echo "Отменено."; exit 1; }; }
+
+step() {   # step <number> <text>
+    local line
+    line=$(printf '%*s' $((${#2} + 12)) '' | tr ' ' '=')
+    echo -e "\n${B}+${line}+${N}"
+    echo -e "${B}|${N}  ${Y}[$1/6]${N} ${W}$2${N}  ${B}|${N}"
+    echo -e "${B}+${line}+${N}"
+}
+
+trap 'echo -e "\n${R}[FAIL]${N} Ошибка на строке $LINENO. Установка прервана." >&2' ERR
+
+# ---------- checks ----------
+[[ $EUID -eq 0 ]] || die "Запустите от root."
+[[ -d /sys/firmware/efi/efivars ]] || die "Система загружена не в UEFI-режиме."
+command -v dialog &>/dev/null || die "Не найден dialog."
+ping -c 1 archlinux.org &>/dev/null || die "Нет интернета. Подключитесь (iwctl / nmtui) и запустите снова."
+
+# ---------- welcome ----------
+d --colors --title " Добро пожаловать " --msgbox "\Zb\Z6         Arch Linux  -  archinst\Zn
+
+Установщик задаст несколько вопросов и
+поставит Arch Linux на выбранный диск.
+
+\Z1Все данные на диске будут удалены!\Zn" 12 52
+
+# ---------- user input ----------
+username=$(d --title " Пользователь " --inputbox "Имя пользователя:" 8 50 "user")
+username=${username:-user}
+
+while true; do
+    userpass=$(d --insecure --title " Пароль " --passwordbox "Пароль пользователя $username:" 8 50)
+    userpass2=$(d --insecure --title " Пароль " --passwordbox "Повторите пароль:" 8 50)
+    [[ -n "$userpass" && "$userpass" == "$userpass2" ]] && break
+    d --title " Ошибка " --msgbox "Пароли не совпадают или пустые. Попробуйте снова." 7 50
+done
+
+if dialog --backtitle "$BT" --title " Пароль root " --yesno "Использовать тот же пароль для root?" 7 50; then
+    rootpass="$userpass"
+else
+    while true; do
+        rootpass=$(d --insecure --title " Пароль root " --passwordbox "Пароль root:" 8 50)
+        rootpass2=$(d --insecure --title " Пароль root " --passwordbox "Повторите пароль:" 8 50)
+        [[ -n "$rootpass" && "$rootpass" == "$rootpass2" ]] && break
+        d --title " Ошибка " --msgbox "Пароли не совпадают или пустые. Попробуйте снова." 7 50
+    done
+fi
+
+hostname=$(d --title " Имя компьютера " --inputbox "Имя компьютера (hostname):" 8 50 "archlinux")
+hostname=${hostname:-archlinux}
+
+timezone=$(d --title " Часовой пояс " --inputbox "Часовой пояс (Region/City):" 8 50 "Europe/Moscow")
+[[ -f /usr/share/zoneinfo/$timezone ]] || die "Часовой пояс '$timezone' не найден."
+
+# disk menu
+items=()
+while read -r name size; do
+    model=$(lsblk -dno MODEL "$name" 2>/dev/null | xargs || true)
+    items+=("$name" "$size  ${model:-disk}")
+done < <(lsblk -dpno NAME,SIZE -e 7,11)
+[[ ${#items[@]} -gt 0 ]] || die "Диски не найдены."
+disk=$(d --title " Диск " --menu "Выберите диск для установки:" 15 60 6 "${items[@]}")
+[[ -b $disk ]] || die "Диск $disk не найден."
+
+# nvme0n1 / mmcblk0 need a 'p' before the partition number
+if [[ "$disk" =~ [0-9]$ ]]; then part="${disk}p"; else part="$disk"; fi
+
+separate_home=no
+if dialog --backtitle "$BT" --title " Разметка " --yesno "Сделать отдельный раздел /home?\n\n  Да  - / = 60 GiB, /home = остальное\n  Нет - / занимает весь диск" 11 54; then
+    separate_home=yes
+fi
+
+# confirmation
+d --colors --title " Подтверждение " --yesno "\
+  Пользователь : \Zb$username\Zn
+  Компьютер    : \Zb$hostname\Zn
+  Часовой пояс : \Zb$timezone\Zn
+  Диск         : \Zb$disk\Zn
+  Отдельный /home: \Zb$separate_home\Zn
+
+\Z1ВСЕ ДАННЫЕ НА $disk БУДУТ УДАЛЕНЫ!\Zn
+
+Начать установку?" 15 56 \
+    || true
+rc=$?   # d aborts on 'No', so reaching here means Yes
+clear
+
+echo -e "${C}"
+cat <<'ART'
+    _             _       ___           _        _ _
+   / \   _ __ ___| |__   |_ _|_ __  ___| |_ __ _| | |
+  / _ \ | '__/ __| '_ \   | || '_ \/ __| __/ _` | | |
+ / ___ \| | | (__| | | |  | || | | \__ \ || (_| | | |
+/_/   \_\_|  \___|_| |_| |___|_| |_|___/\__\__,_|_|_|
+ART
+echo -e "${N}"
+
+# ---------- 1. partitioning ----------
+step 1 "Разметка диска"
+wipefs -a "$disk"
+parted -s "$disk" mklabel gpt
+parted -s "$disk" mkpart ESP fat32 1MiB 513MiB
+parted -s "$disk" set 1 esp on
+if [[ $separate_home == yes ]]; then
+    parted -s "$disk" mkpart root ext4 513MiB 60GiB
+    parted -s "$disk" mkpart home ext4 60GiB 100%
+else
+    parted -s "$disk" mkpart root ext4 513MiB 100%
+fi
+partprobe "$disk"; sleep 1
+ok "Таблица разделов создана"
+
+# ---------- 2. formatting ----------
+step 2 "Форматирование разделов"
+mkfs.fat -F 32 "${part}1"
+mkfs.ext4 -F "${part}2"
+[[ $separate_home == yes ]] && mkfs.ext4 -F "${part}3"
+ok "Разделы отформатированы"
+
+# ---------- 3. mounting ----------
+step 3 "Монтирование разделов"
+mount "${part}2" /mnt
+mount --mkdir "${part}1" /mnt/boot
+[[ $separate_home == yes ]] && mount --mkdir "${part}3" /mnt/home
+ok "Разделы смонтированы"
+
+# ---------- 4. pacstrap ----------
+step 4 "Установка базовой системы (pacstrap)"
+ping -c 1 archlinux.org &>/dev/null || die "Пропал интернет."
+pacstrap -K /mnt linux linux-firmware base base-devel grub efibootmgr \
+    networkmanager vim micro dhcpcd iwd sudo
+genfstab -U /mnt >> /mnt/etc/fstab
+ok "Базовая система установлена"
+
+# ---------- 5. chroot ----------
+step 5 "Настройка системы (chroot)"
+export username rootpass userpass hostname timezone
+
+arch-chroot /mnt /bin/bash <<'EOF'
+set -euo pipefail
+
+ln -sf "/usr/share/zoneinfo/$timezone" /etc/localtime
+hwclock --systohc
+
+cat > /etc/locale.gen <<LOC
+en_US.UTF-8 UTF-8
+ru_RU.UTF-8 UTF-8
+LOC
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+
+echo "$hostname" > /etc/hostname
+
+echo "root:$rootpass" | chpasswd
+useradd -m -G wheel,users,video -s /bin/bash "$username"
+echo "$username:$userpass" | chpasswd
+sed -i 's/^# *%wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+grub-mkconfig -o /boot/grub/grub.cfg
+
+systemctl enable NetworkManager
+EOF
+unset rootpass userpass userpass2 rootpass2
+ok "Система настроена"
+
+# ---------- 6. finish ----------
+step 6 "Завершение"
+umount -R /mnt
+echo -e "${G}"
+cat <<'ART'
+  ___           _        _ _       _   _
+ |_ _|_ __  ___| |_ __ _| | | __ _| |_(_) ___  _ __
+  | || '_ \/ __| __/ _` | | |/ _` | __| |/ _ \| '_ \
+  | || | | \__ \ || (_| | | | (_| | |_| | (_) | | | |
+ |___|_| |_|___/\__\__,_|_|_|\__,_|\__|_|\___/|_| |_|
+              ____                      _      _
+             / ___|___  _ __ ___  _ __ | | ___| |_ ___
+            | |   / _ \| '_ ` _ \| '_ \| |/ _ \ __/ _ \
+            | |__| (_) | | | | | | |_) | |  __/ ||  __/
+             \____\___/|_| |_| |_| .__/|_|\___|\__\___|
+                                 |_|
+ART
+echo -e "${N}"
+
+if dialog --backtitle "$BT" --title " Готово " --yesno "Установка завершена.\n\nПерезагрузить сейчас?" 8 44; then
+    clear; info "reboot..."; reboot
+else
+    clear; info "Готово. Выполните 'reboot' и извлеките установочный носитель."
+fi
